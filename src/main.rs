@@ -184,8 +184,10 @@ async fn main() {
             // Logique de Handoff
             for player in players.iter_mut() {
                 let old_shard = player.current_shard_id;
-                player.current_shard_id = evaluate_handoff(player, &voronoi_shards, hysteresis_margin);
-                if player.current_shard_id != old_shard { stats_handoffs += 1; }
+                player.current_shard_id = evaluate_handoff(player, &voronoi_shards, &voronoi_data, hysteresis_margin);
+                if player.current_shard_id != old_shard {
+                    stats_handoffs += 1;
+                }
             }
 
             // Dessin des centres de serveurs

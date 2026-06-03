@@ -36,6 +36,7 @@ pub struct Player {
 pub struct VoronoiCellData {
     pub aabb: Rect,
     pub polygon: Vec<Point2D>,
+    pub neighbors: Vec<u32>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -64,14 +65,14 @@ pub fn calculate_voronoi_data(
 
     let w = map_width as f64;
     let h = map_height as f64;
-    
+
     for shard in shards {
         let id = shard.id;
         let x = shard.pos.x as f64;
         let y = shard.pos.y as f64;
-        
+
         triangulation.insert(ServerVertex { id, point: Point2::new(x, y) }).unwrap();
-        
+
         let dummy = id + 1_000_000;
 
         // Reflets sur les 4 murs (Garantit que les bords sont parfaitement coupés droits)
@@ -99,7 +100,7 @@ pub fn calculate_voronoi_data(
         let mut max_x = f64::MIN;
         let mut max_y = f64::MIN;
         let mut polygon = Vec::new();
-        
+
         for edge in face.adjacent_edges() {
             if let spade::handles::VoronoiVertex::Inner(inner) = edge.from() {
                 let p = inner.circumcenter();
@@ -120,9 +121,18 @@ pub fn calculate_voronoi_data(
         let rect_w = (final_max_x - final_min_x).max(1.0);
         let rect_h = (final_max_y - final_min_y).max(1.0);
 
+        let mut neighbors = Vec::new();
+        for edge in vertex.out_edges() {
+            let neighbor_id = edge.to().data().id;
+            if neighbor_id < 1_000_000 {
+                neighbors.push(neighbor_id);
+            }
+        }
+
         cells.insert(shard_id, VoronoiCellData {
             aabb: Rect::new(final_min_x, final_min_y, rect_w, rect_h),
             polygon,
+            neighbors,
         });
     }
 
@@ -143,26 +153,48 @@ pub fn find_nearest_shard_id(pos: &Point2D, shards: &[Shard]) -> u32 {
     nearest_id
 }
 
-pub fn evaluate_handoff(player: &Player, shards: &[Shard], hysteresis_margin: f32) -> u32 {
+pub fn evaluate_handoff(
+    player: &Player,
+    shards: &[Shard],
+    voronoi_data: &HashMap<u32, VoronoiCellData>,
+    hysteresis_margin: f32
+) -> u32 {
     let current_shard = shards.iter().find(|s| s.id == player.current_shard_id);
-    let current_shard = match current_shard {
-        Some(s) => s,
-        None => return find_nearest_shard_id(&player.pos, shards),
-    };
 
-    let current_dist_sq = player.pos.distance_sq(&current_shard.pos);
-    let best_id = find_nearest_shard_id(&player.pos, shards);
+    // 1. Si le joueur a déjà un serveur et que ce serveur existe dans nos données
+    if let Some(current) = current_shard {
+        if let Some(cell_data) = voronoi_data.get(&current.id) {
 
-    if best_id != player.current_shard_id {
-        let best_shard = shards.iter().find(|s| s.id == best_id).unwrap();
-        let best_dist_sq = player.pos.distance_sq(&best_shard.pos);
-        let margin_sq = hysteresis_margin * hysteresis_margin;
+            let mut best_id = current.id;
+            let mut best_dist_sq = player.pos.distance_sq(&current.pos);
+            let current_dist_sq = best_dist_sq;
 
-        if best_dist_sq < (current_dist_sq - margin_sq) {
-            return best_id;
+            // 2. OPTIMISATION : On ne teste QUE les serveurs frontaliers !
+            for &neighbor_id in &cell_data.neighbors {
+                if let Some(neighbor_shard) = shards.iter().find(|s| s.id == neighbor_id) {
+                    let dist_sq = player.pos.distance_sq(&neighbor_shard.pos);
+                    if dist_sq < best_dist_sq {
+                        best_dist_sq = dist_sq;
+                        best_id = neighbor_id;
+                    }
+                }
+            }
+
+            // 3. Application de l'hystérésis pour éviter le flapping
+            if best_id != current.id {
+                let margin_sq = hysteresis_margin * hysteresis_margin;
+                if best_dist_sq < (current_dist_sq - margin_sq) {
+                    return best_id;
+                }
+            }
+            return current.id;
         }
     }
-    player.current_shard_id
+
+    // FALLBACK (Sécurité) : Si le joueur vient d'apparaître, qu'il s'est téléporté,
+    // ou que son shard d'origine vient de fusionner/disparaître,
+    // on fait une recherche globale classique O(S) pour lui trouver sa nouvelle maison.
+    find_nearest_shard_id(&player.pos, shards)
 }
 
 pub fn update_dynamic_sharding(shards: &mut Vec<Shard>, players: &mut [Player], next_shard_id: &mut u32, current_tick: u64) -> bool {
