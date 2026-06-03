@@ -3,6 +3,23 @@ use std::collections::HashMap;
 use macroquad::prelude::Rect;
 use spade::{DelaunayTriangulation, HasPosition, Point2, Triangulation};
 
+#[derive(Debug, Clone)]
+pub struct ShardMetrics {
+    pub count: u32,
+    pub centroid: Point2D,
+    pub positions: Vec<Point2D>, // La mémoire de ce Vec sera conservée d'un tick à l'autre !
+}
+
+impl Default for ShardMetrics {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            centroid: Point2D { x: 0.0, y: 0.0 },
+            positions: Vec::with_capacity(128), // Pré-alloué pour 128 joueurs par défaut
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Point2D {
     pub x: f32,
@@ -30,6 +47,7 @@ pub struct Player {
     pub id: u32,
     pub pos: Point2D,
     pub current_shard_id: u32,
+    pub angle: f32, // NOUVEAU : Chaque joueur possède sa direction !
 }
 
 #[derive(Debug, Clone)]
@@ -197,42 +215,46 @@ pub fn evaluate_handoff(
     find_nearest_shard_id(&player.pos, shards)
 }
 
-pub fn update_dynamic_sharding(shards: &mut Vec<Shard>, players: &mut [Player], next_shard_id: &mut u32, current_tick: u64) -> bool {
-    let mut shard_populations: HashMap<u32, Vec<Point2D>> = HashMap::new();
-    for player in players.iter() {
-        shard_populations.entry(player.current_shard_id).or_default().push(player.pos);
-    }
-
+pub fn update_dynamic_sharding(
+    shards: &mut Vec<Shard>,
+    players: &mut [Player], // Gardé mut pour le routing des joueurs orphelins
+    metrics: &HashMap<u32, ShardMetrics>, // Remplacé
+    next_shard_id: &mut u32,
+    current_tick: u64
+) -> bool {
     let mut split_occurred = false;
     let mut shards_to_remove = Vec::new();
     let mut new_shards = Vec::new();
 
-    for (shard_id, player_positions) in shard_populations {
-        let shard = shards.iter().find(|s| s.id == shard_id).unwrap();
+    for shard in shards.iter() {
+        if let Some(m) = metrics.get(&shard.id) {
+            // Lecture instantanée du count !
+            if m.count >= 5 && current_tick > shard.spawn_tick + 60 {
+                split_occurred = true;
+                shards_to_remove.push(shard.id);
 
-        if player_positions.len() >= 5 && current_tick > shard.spawn_tick + 60 {
-            split_occurred = true;
-            shards_to_remove.push(shard_id);
+                let mut min_x_p = m.positions[0];
+                let mut max_x_p = m.positions[0];
+                let mut min_y_p = m.positions[0];
+                let mut max_y_p = m.positions[0];
 
-            let mut max_dist_sq = -1.0;
-            let mut p1 = player_positions[0];
-            let mut p2 = player_positions[1];
-
-            for i in 0..player_positions.len() {
-                for j in (i + 1)..player_positions.len() {
-                    let dist = player_positions[i].distance_sq(&player_positions[j]);
-                    if dist > max_dist_sq {
-                        max_dist_sq = dist;
-                        p1 = player_positions[i];
-                        p2 = player_positions[j];
-                    }
+                for &p in m.positions.iter().skip(1) {
+                    if p.x < min_x_p.x { min_x_p = p; }
+                    if p.x > max_x_p.x { max_x_p = p; }
+                    if p.y < min_y_p.y { min_y_p = p; }
+                    if p.y > max_y_p.y { max_y_p = p; }
                 }
-            }
 
-            new_shards.push(Shard { id: *next_shard_id, pos: p1, spawn_tick: current_tick });
-            *next_shard_id += 1;
-            new_shards.push(Shard { id: *next_shard_id, pos: p2, spawn_tick: current_tick });
-            *next_shard_id += 1;
+                let dx = max_x_p.x - min_x_p.x;
+                let dy = max_y_p.y - min_y_p.y;
+
+                let (p1, p2) = if dx > dy { (min_x_p, max_x_p) } else { (min_y_p, max_y_p) };
+
+                new_shards.push(Shard { id: *next_shard_id, pos: p1, spawn_tick: current_tick });
+                *next_shard_id += 1;
+                new_shards.push(Shard { id: *next_shard_id, pos: p2, spawn_tick: current_tick });
+                *next_shard_id += 1;
+            }
         }
     }
 
@@ -241,50 +263,44 @@ pub fn update_dynamic_sharding(shards: &mut Vec<Shard>, players: &mut [Player], 
         shards.extend(new_shards);
 
         for player in players.iter_mut() {
-            player.current_shard_id = find_nearest_shard_id(&player.pos, shards);
+            if shards_to_remove.contains(&player.current_shard_id) {
+                player.current_shard_id = find_nearest_shard_id(&player.pos, shards);
+            }
         }
     }
     split_occurred
 }
 
-pub fn relax_shards(shards: &mut [Shard], players: &[Player], lerp_factor: f32) -> bool {
+pub fn relax_shards(shards: &mut [Shard], metrics: &HashMap<u32, ShardMetrics>, lerp_factor: f32) -> bool {
     let mut moved = false;
-    let mut centroids: HashMap<u32, Point2D> = HashMap::new();
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-
-    for p in players {
-        let c = centroids.entry(p.current_shard_id).or_insert(Point2D { x: 0.0, y: 0.0 });
-        c.x += p.pos.x;
-        c.y += p.pos.y;
-        *counts.entry(p.current_shard_id).or_insert(0) += 1;
-    }
 
     for shard in shards.iter_mut() {
-        if let Some(count) = counts.get(&shard.id) {
-            let cx = centroids[&shard.id].x / (*count as f32);
-            let cy = centroids[&shard.id].y / (*count as f32);
+        if let Some(m) = metrics.get(&shard.id) {
+            if m.count > 0 {
+                let cx = m.centroid.x / (m.count as f32);
+                let cy = m.centroid.y / (m.count as f32);
 
-            let dx = cx - shard.pos.x;
-            let dy = cy - shard.pos.y;
+                let dx = cx - shard.pos.x;
+                let dy = cy - shard.pos.y;
 
-            if dx * dx + dy * dy > 1.0 {
-                shard.pos.x += dx * lerp_factor;
-                shard.pos.y += dy * lerp_factor;
-                moved = true;
+                if dx * dx + dy * dy > 1.0 {
+                    shard.pos.x += dx * lerp_factor;
+                    shard.pos.y += dy * lerp_factor;
+                    moved = true;
+                }
             }
         }
     }
     moved
 }
 
-pub fn merge_underpopulated_shards(shards: &mut Vec<Shard>, players: &[Player], next_shard_id: &mut u32, current_tick: u64) -> bool {
+pub fn merge_underpopulated_shards(
+    shards: &mut Vec<Shard>,
+    metrics: &HashMap<u32, ShardMetrics>,
+    next_shard_id: &mut u32,
+    current_tick: u64
+) -> bool {
     if shards.len() <= 1 { return false; }
-
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-    for shard in shards.iter() { counts.insert(shard.id, 0); }
-    for player in players {
-        if let Some(c) = counts.get_mut(&player.current_shard_id) { *c += 1; }
-    }
 
     let mut best_pair: Option<(usize, usize)> = None;
     let mut min_dist_sq = f32::MAX;
@@ -299,8 +315,9 @@ pub fn merge_underpopulated_shards(shards: &mut Vec<Shard>, players: &[Player], 
                 continue;
             }
 
-            let count_i = counts[&shard_i.id];
-            let count_j = counts[&shard_j.id];
+            // Lecture instantanée en O(1) !
+            let count_i = metrics.get(&shard_i.id).map(|m| m.count).unwrap_or(0);
+            let count_j = metrics.get(&shard_j.id).map(|m| m.count).unwrap_or(0);
 
             if count_i + count_j <= 2 {
                 let dist_sq = shard_i.pos.distance_sq(&shard_j.pos);

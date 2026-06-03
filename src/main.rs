@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use voronoi::*;
 use quadtree::*;
 use render::*;
+use rayon::prelude::*; // Active la magie du multithreading
 
 fn window_conf() -> Conf {
     Conf {
@@ -43,6 +44,9 @@ async fn main() {
     ];
     let mut voronoi_data: HashMap<u32, VoronoiCellData> = HashMap::new();
 
+    // NOUVEAU : Le buffer global qui ne sera jamais détruit
+    let mut shard_metrics: HashMap<u32, ShardMetrics> = HashMap::new();
+
     // --- ÉTAT QUADTREE ---
     let mut quad_root = QuadNode::new(1, QuadRect { x: 0.0, y: 0.0, w: screen_w, h: screen_h }, 0);
 
@@ -52,7 +56,6 @@ async fn main() {
     let mut selected_player_idx: Option<usize> = None;
     let hysteresis_margin = 30.0;
     let mut auto_move = false;
-    let mut player_angles: HashMap<u32, f32> = HashMap::new();
 
     // --- STATISTIQUES ET RESEAU ---
     let mut sim_time: f32 = 0.0;
@@ -130,7 +133,10 @@ async fn main() {
             };
 
             players.push(Player {
-                id: next_player_id, pos: mouse_pos, current_shard_id: initial_shard_id,
+                id: next_player_id,
+                pos: mouse_pos,
+                current_shard_id: initial_shard_id,
+                angle: macroquad::rand::gen_range(0.0, std::f32::consts::PI * 2.0), // On lui donne un angle à la naissance !
             });
             next_player_id += 1;
         }
@@ -142,38 +148,64 @@ async fn main() {
             sim_time += dt;
             let speed_per_sec = 150.0;
 
-            for (i, player) in players.iter_mut().enumerate() {
-                if Some(i) == selected_player_idx { continue; }
-                let angle = player_angles.entry(player.id).or_insert_with(|| macroquad::rand::gen_range(0.0, std::f32::consts::PI * 2.0));
-                *angle += macroquad::rand::gen_range(-2.0, 2.0) * dt;
+            // On copie les variables locales dont les threads auront besoin (car ils ne peuvent pas accéder à screen_w directement)
+            let w = screen_w;
+            let h = screen_h;
+            let selected = selected_player_idx;
 
-                player.pos.x += angle.cos() * speed_per_sec * dt;
-                player.pos.y += angle.sin() * speed_per_sec * dt;
+            // PARALLÉLISATION : Tous les cœurs CPU calculent la physique simultanément
+            players.par_iter_mut().enumerate().for_each(|(i, player)| {
+                if Some(i) == selected { return; } // On ignore le joueur attrapé par la souris
 
-                if player.pos.x < 15.0 || player.pos.x > screen_w - 15.0 {
-                    *angle = std::f32::consts::PI - *angle;
-                    player.pos.x = player.pos.x.clamp(15.0, screen_w - 15.0);
+                // (Note : on retire la variation aléatoire d'angle car le générateur aléatoire
+                // n'est pas "Thread-Safe" par défaut. Les joueurs rebondiront comme des boules de billard, ce qui est parfait pour un stress test).
+                player.pos.x += player.angle.cos() * speed_per_sec * dt;
+                player.pos.y += player.angle.sin() * speed_per_sec * dt;
+
+                if player.pos.x < 15.0 || player.pos.x > w - 15.0 {
+                    player.angle = std::f32::consts::PI - player.angle;
+                    player.pos.x = player.pos.x.clamp(15.0, w - 15.0);
                 }
-                if player.pos.y < 15.0 || player.pos.y > screen_h - 15.0 {
-                    *angle = -*angle;
-                    player.pos.y = player.pos.y.clamp(15.0, screen_h - 15.0);
+                if player.pos.y < 15.0 || player.pos.y > h - 15.0 {
+                    player.angle = -player.angle;
+                    player.pos.y = player.pos.y.clamp(15.0, h - 15.0);
                 }
-            }
+            });
         }
 
         // ==============================
         //      MODE VORONOI (OPTIMISÉ)
         // ==============================
         if mode == AppMode::Voronoi {
+
+            // --- 1. PASSE UNIQUE D'AGRÉGATION ---
+            // On vide les vecteurs (ce qui GARDE la mémoire allouée grâce à .clear())
+            for metric in shard_metrics.values_mut() {
+                metric.count = 0;
+                metric.positions.clear();
+                metric.centroid = Point2D { x: 0.0, y: 0.0 };
+            }
+
+            // Un seul passage sur les joueurs pour tout le tick !
+            for player in &players {
+                let m = shard_metrics.entry(player.current_shard_id).or_default();
+                m.count += 1;
+                m.positions.push(player.pos);
+                m.centroid.x += player.pos.x;
+                m.centroid.y += player.pos.y;
+            }
+            // ------------------------------------
+
             let id_before_split = next_shard_id;
-            update_dynamic_sharding(&mut voronoi_shards, &mut players, &mut next_shard_id, current_tick);
+            // On passe notre buffer aux fonctions
+            update_dynamic_sharding(&mut voronoi_shards, &mut players, &shard_metrics, &mut next_shard_id, current_tick);
             stats_splits += (next_shard_id - id_before_split) / 2;
 
             let id_before_merge = next_shard_id;
-            merge_underpopulated_shards(&mut voronoi_shards, &players, &mut next_shard_id, current_tick);
+            merge_underpopulated_shards(&mut voronoi_shards, &shard_metrics, &mut next_shard_id, current_tick);
             stats_merges += next_shard_id - id_before_merge;
 
-            relax_shards(&mut voronoi_shards, &players, 0.05);
+            relax_shards(&mut voronoi_shards, &shard_metrics, 0.05);
 
             // BACKEND : Calcul de la géométrie (Réseau + Polygones)
             voronoi_data = calculate_voronoi_data(&voronoi_shards, screen_w, screen_h, ghost_margin);
@@ -181,14 +213,19 @@ async fn main() {
             // FRONTEND : Rendu GPU ultra-rapide
             draw_voronoi_polygons(&voronoi_shards, &voronoi_data);
 
-            // Logique de Handoff
-            for player in players.iter_mut() {
+            // --- ROUTAGE MULTITHREADÉ ---
+            // On distribue le calcul de distance de tous les joueurs sur le processeur,
+            // et on additionne (sum) instantanément le nombre de transferts (Handoffs) effectués.
+            let handoffs_this_tick: u32 = players.par_iter_mut().map(|player| {
                 let old_shard = player.current_shard_id;
+
+                // La lecture de voronoi_data est parfaitement "Thread-Safe" car elle est immuable ici !
                 player.current_shard_id = evaluate_handoff(player, &voronoi_shards, &voronoi_data, hysteresis_margin);
-                if player.current_shard_id != old_shard {
-                    stats_handoffs += 1;
-                }
-            }
+
+                if player.current_shard_id != old_shard { 1 } else { 0 }
+            }).sum();
+
+            stats_handoffs += handoffs_this_tick;
 
             // Dessin des centres de serveurs
             for shard in voronoi_shards.iter() {
