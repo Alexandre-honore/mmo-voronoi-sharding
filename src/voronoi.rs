@@ -7,7 +7,7 @@ use spade::{DelaunayTriangulation, HasPosition, Point2, Triangulation};
 pub struct ShardMetrics {
     pub count: u32,
     pub centroid: Point2D,
-    pub positions: Vec<Point2D>, // La mémoire de ce Vec sera conservée d'un tick à l'autre !
+    pub positions: Vec<Point2D>,
 }
 
 impl Default for ShardMetrics {
@@ -15,7 +15,7 @@ impl Default for ShardMetrics {
         Self {
             count: 0,
             centroid: Point2D { x: 0.0, y: 0.0 },
-            positions: Vec::with_capacity(128), // Pré-alloué pour 128 joueurs par défaut
+            positions: Vec::with_capacity(128),
         }
     }
 }
@@ -47,7 +47,7 @@ pub struct Player {
     pub id: u32,
     pub pos: Point2D,
     pub current_shard_id: u32,
-    pub angle: f32, // NOUVEAU : Chaque joueur possède sa direction !
+    pub angle: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -93,13 +93,11 @@ pub fn calculate_voronoi_data(
 
         let dummy = id + 1_000_000;
 
-        // Reflets sur les 4 murs (Garantit que les bords sont parfaitement coupés droits)
-        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(-x, y) }).unwrap(); // Mur Gauche
-        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(2.0 * w - x, y) }).unwrap(); // Mur Droit
-        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(x, -y) }).unwrap(); // Plafond
-        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(x, 2.0 * h - y) }).unwrap(); // Sol
-
-        // Reflets dans les 4 coins (Garantit que les angles morts sont fermés)
+        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(-x, y) }).unwrap();
+        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(2.0 * w - x, y) }).unwrap();
+        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(x, -y) }).unwrap();
+        triangulation.insert(ServerVertex { id: dummy, point: Point2::new(x, 2.0 * h - y) }).unwrap();
+        
         triangulation.insert(ServerVertex { id: dummy, point: Point2::new(-x, -y) }).unwrap();
         triangulation.insert(ServerVertex { id: dummy, point: Point2::new(2.0 * w - x, -y) }).unwrap();
         triangulation.insert(ServerVertex { id: dummy, point: Point2::new(-x, 2.0 * h - y) }).unwrap();
@@ -108,8 +106,7 @@ pub fn calculate_voronoi_data(
 
     for vertex in triangulation.vertices() {
         let shard_id = vertex.data().id;
-
-        // On ignore totalement la géométrie des miroirs
+        
         if shard_id >= 1_000_000 { continue; }
 
         let face = vertex.as_voronoi_face();
@@ -162,7 +159,7 @@ pub fn find_nearest_shard_id(pos: &Point2D, shards: &[Shard]) -> u32 {
     let mut nearest_id = shards[0].id;
 
     for shard in shards {
-        let dist = pos.distance_sq(&shard.pos); // Géométrie pure, plus de weight
+        let dist = pos.distance_sq(&shard.pos);
         if dist < min_dist {
             min_dist = dist;
             nearest_id = shard.id;
@@ -178,16 +175,14 @@ pub fn evaluate_handoff(
     hysteresis_margin: f32
 ) -> u32 {
     let current_shard = shards.iter().find(|s| s.id == player.current_shard_id);
-
-    // 1. Si le joueur a déjà un serveur et que ce serveur existe dans nos données
+    
     if let Some(current) = current_shard {
         if let Some(cell_data) = voronoi_data.get(&current.id) {
 
             let mut best_id = current.id;
             let mut best_dist_sq = player.pos.distance_sq(&current.pos);
             let current_dist_sq = best_dist_sq;
-
-            // 2. OPTIMISATION : On ne teste QUE les serveurs frontaliers !
+            
             for &neighbor_id in &cell_data.neighbors {
                 if let Some(neighbor_shard) = shards.iter().find(|s| s.id == neighbor_id) {
                     let dist_sq = player.pos.distance_sq(&neighbor_shard.pos);
@@ -197,8 +192,7 @@ pub fn evaluate_handoff(
                     }
                 }
             }
-
-            // 3. Application de l'hystérésis pour éviter le flapping
+            
             if best_id != current.id {
                 let margin_sq = hysteresis_margin * hysteresis_margin;
                 if best_dist_sq < (current_dist_sq - margin_sq) {
@@ -208,17 +202,14 @@ pub fn evaluate_handoff(
             return current.id;
         }
     }
-
-    // FALLBACK (Sécurité) : Si le joueur vient d'apparaître, qu'il s'est téléporté,
-    // ou que son shard d'origine vient de fusionner/disparaître,
-    // on fait une recherche globale classique O(S) pour lui trouver sa nouvelle maison.
+    
     find_nearest_shard_id(&player.pos, shards)
 }
 
 pub fn update_dynamic_sharding(
     shards: &mut Vec<Shard>,
-    players: &mut [Player], // Gardé mut pour le routing des joueurs orphelins
-    metrics: &HashMap<u32, ShardMetrics>, // Remplacé
+    players: &mut [Player],
+    metrics: &HashMap<u32, ShardMetrics>,
     next_shard_id: &mut u32,
     current_tick: u64
 ) -> bool {
@@ -228,7 +219,6 @@ pub fn update_dynamic_sharding(
 
     for shard in shards.iter() {
         if let Some(m) = metrics.get(&shard.id) {
-            // Lecture instantanée du count !
             if m.count >= 5 && current_tick > shard.spawn_tick + 60 {
                 split_occurred = true;
                 shards_to_remove.push(shard.id);
@@ -314,8 +304,7 @@ pub fn merge_underpopulated_shards(
             if current_tick < shard_i.spawn_tick + 60 || current_tick < shard_j.spawn_tick + 60 {
                 continue;
             }
-
-            // Lecture instantanée en O(1) !
+            
             let count_i = metrics.get(&shard_i.id).map(|m| m.count).unwrap_or(0);
             let count_j = metrics.get(&shard_j.id).map(|m| m.count).unwrap_or(0);
 
