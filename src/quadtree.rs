@@ -1,5 +1,7 @@
 ﻿// src/quadtree.rs
-use crate::voronoi::{Player, Point2D};
+use crate::engine::{PlayerData, PlayerKey};
+use crate::voronoi::Point2D;
+use slotmap::SlotMap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct QuadRect {
@@ -13,11 +15,6 @@ impl QuadRect {
     pub fn contains(&self, p: &Point2D) -> bool {
         p.x >= self.x && p.x <= self.x + self.w &&
             p.y >= self.y && p.y <= self.y + self.h
-    }
-
-    pub fn contains_with_margin(&self, p: &Point2D, margin: f32) -> bool {
-        p.x >= self.x - margin && p.x <= self.x + self.w + margin &&
-            p.y >= self.y - margin && p.y <= self.y + self.h + margin
     }
 }
 
@@ -54,11 +51,12 @@ impl QuadNode {
         }
     }
 
-    fn count_players_in_rect(rect: &QuadRect, players: &[Player]) -> usize {
-        players.iter().filter(|p| rect.contains(&p.pos)).count()
+    // Adapté pour lire directement depuis la SlotMap de l'Orchestrateur
+    fn count_players_in_rect(rect: &QuadRect, players: &SlotMap<PlayerKey, PlayerData>) -> usize {
+        players.values().filter(|p| rect.contains(&p.pos)).count()
     }
 
-    pub fn update(&mut self, players: &[Player], next_shard_id: &mut u32, current_tick: u64) -> bool {
+    pub fn update(&mut self, players: &SlotMap<PlayerKey, PlayerData>, next_shard_id: &mut u32, current_tick: u64) -> bool {
         let mut changed = false;
 
         if let Some(children) = &mut self.children {
@@ -67,7 +65,8 @@ impl QuadNode {
             }
 
             let all_leaves = children.iter().all(|c| c.children.is_none());
-            let cooldown_ok = children.iter().all(|c| current_tick > c.spawn_tick + 60);
+            // Délai de grâce adapté pour 2 Hz (ex: 10 ticks = 5 secondes)
+            let cooldown_ok = children.iter().all(|c| current_tick > c.spawn_tick + 10);
 
             if all_leaves && cooldown_ok {
                 let total_pop: usize = children.iter()
@@ -81,7 +80,7 @@ impl QuadNode {
                 }
             }
         } else {
-            if current_tick > self.spawn_tick + 60 {
+            if current_tick > self.spawn_tick + 10 {
                 let pop = Self::count_players_in_rect(&self.rect, players);
 
                 if pop >= 5 {

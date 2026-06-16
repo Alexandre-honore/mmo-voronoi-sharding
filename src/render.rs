@@ -1,6 +1,6 @@
 ﻿// src/render.rs
 use macroquad::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap; // <-- ON UTILISE FXHASHMAP ICI MAINTENANT
 use crate::voronoi::{Shard, VoronoiCellData};
 
 const PALETTE: [Color; 10] = [RED, GREEN, BLUE, MAGENTA, ORANGE, YELLOW, DARKGREEN, PURPLE, PINK, SKYBLUE];
@@ -9,7 +9,8 @@ pub fn get_shard_color(id: u32) -> Color {
     PALETTE[(id as usize) % PALETTE.len()]
 }
 
-pub fn draw_voronoi_polygons(shards: &[Shard], cells: &HashMap<u32, VoronoiCellData>) {
+// On change la signature pour accepter une FxHashMap
+pub fn draw_voronoi_polygons(shards: &[Shard], cells: &FxHashMap<u32, VoronoiCellData>) {
     for shard in shards {
         if let Some(cell) = cells.get(&shard.id) {
             let mut color = get_shard_color(shard.id);

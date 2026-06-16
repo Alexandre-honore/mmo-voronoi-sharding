@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-macroquad = "0.4.15"
-spade = "2.6"
-rayon = "1.10"
-hecs = "0.10"
+macroquad = "0.4"
+spade = "2.0"
+slotmap = "1.0"
+rustc-hash = "1.1"
